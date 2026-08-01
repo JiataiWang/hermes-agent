@@ -191,16 +191,58 @@ def test_handler_nonzero_exit_is_error():
 
 
 def test_handler_timeout():
-    # Patch subprocess.run to raise TimeoutExpired so we exercise the handler's
+    # Patch _run_bounded to report a timeout so we exercise the handler's
     # timeout branch without spawning/killing a real long-running process
-    # (the test harness's live-system guard blocks the os.kill cleanup that a
+    # (the test harness's live-system guard blocks the killpg cleanup that a
     # real timeout would trigger).
     h = _handler_for("sleep 5", [], timeout=1)
-    with patch("plugins.yaml_tools.subprocess.run",
-               side_effect=subprocess.TimeoutExpired(cmd="sleep 5", timeout=1)):
+    with patch("plugins.yaml_tools._run_bounded", return_value=("", True, None)):
         out = json.loads(h({}))
     assert "timed out after 1s" in out["error"]
     assert out["success"] is False
+
+
+def test_reserved_param_name_rejected_at_load(home):
+    # A parameter that maps to an execution-sensitive env var (PATH, LD_PRELOAD,
+    # …) must be refused so a model value can't hijack command resolution.
+    _write_tool(home, "hijack.yaml", (
+        "name: hijack\n"
+        "command: 'echo hi'\n"
+        "parameters:\n"
+        "  path:\n"
+        "    type: string\n"
+    ))
+    with pytest.raises(ValueError):
+        _load_spec(home / "tools" / "hijack.yaml")
+
+
+def test_handler_does_not_clobber_reserved_env():
+    # Even if a reserved name slipped through, the handler must not overwrite
+    # PATH with a model value — the real PATH stays intact.
+    h = _handler_for('echo "$PATH"', ["PATH"])
+    out = json.loads(h({"PATH": "/tmp/evil"}))
+    assert out["exit_code"] == 0
+    assert "/tmp/evil" != out["output"].strip()
+
+
+def test_handler_runs_through_approval_gate():
+    # A denied command must not execute; the guard's message is surfaced.
+    h = _handler_for("echo hi", [])
+    with patch("tools.approval.check_dangerous_command",
+               return_value={"approved": False, "message": "nope"}):
+        out = json.loads(h({}))
+    assert out["success"] is False
+    assert "nope" in out["error"]
+
+
+def test_handler_bounds_large_output():
+    # Output larger than the cap is truncated rather than buffered whole.
+    from plugins.yaml_tools import _MAX_OUTPUT_CHARS
+    h = _handler_for(f'yes X | head -c {_MAX_OUTPUT_CHARS * 2}', [])
+    out = json.loads(h({}))
+    assert out["exit_code"] == 0
+    assert len(out["output"]) <= _MAX_OUTPUT_CHARS + 64
+    assert "output truncated" in out["output"]
 
 
 def test_handler_shell_injection_is_neutralized(tmp_path):

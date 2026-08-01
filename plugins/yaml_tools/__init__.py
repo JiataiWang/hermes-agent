@@ -27,6 +27,13 @@ of a variable expansion for command substitution, so a value such as
 ``$(rm -rf ~)`` or ``"; rm -rf ~ ; "`` is treated as a literal string, not
 executed. The command template is authored by the user (trusted); only the
 argument *values* come from the model.
+
+Parameters may not map to execution-sensitive environment variables (``PATH``,
+``LD_PRELOAD``, …) — those are rejected at load time (see ``_RESERVED_ENV``) so
+a value can't hijack how the shell resolves commands. Each invocation still
+goes through the normal command-approval pipeline (#68187), and output is
+captured with a hard size bound while the command runs in its own process
+group so a timeout kills its descendants too.
 """
 
 from __future__ import annotations
@@ -49,6 +56,20 @@ _ALLOWED_PARAM_TYPES = {"string", "number", "integer", "boolean"}
 # Tool and parameter names must be valid identifiers so they are safe as both
 # function-call names and environment-variable names.
 _NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Parameter values are exported as environment variables (see _make_handler).
+# These names control how the shell / dynamic loader resolves and runs
+# executables, so a model-supplied value landing in one would turn an argument
+# into command hijacking or code execution (e.g. a `path` parameter clobbering
+# PATH, or `ld_preload` -> LD_PRELOAD). Parameters may not map to them; the
+# check is case-insensitive so it covers both the exact and upper-cased
+# spelling the handler exports.
+_RESERVED_ENV = frozenset({
+    "PATH", "IFS", "ENV", "BASH_ENV", "BASHOPTS", "SHELLOPTS", "PS4",
+    "PROMPT_COMMAND", "GLOBIGNORE", "CDPATH",
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_PROFILE",
+    "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
+})
 
 
 def register(ctx) -> None:
@@ -152,6 +173,12 @@ def _load_spec(path: Path) -> Tuple[str, dict, str, int]:
                 f"invalid parameter name {pname!r}: use letters, digits and "
                 "underscores, starting with a letter or underscore"
             )
+        if pname.upper() in _RESERVED_ENV:
+            raise ValueError(
+                f"parameter name {pname!r} is reserved: it maps to the "
+                f"environment variable {pname.upper()}, which controls how the "
+                "shell resolves and runs commands — rename the parameter"
+            )
         pspec = pspec or {}
         if not isinstance(pspec, dict):
             raise ValueError(f"parameter {pname!r} spec must be a mapping")
@@ -213,8 +240,12 @@ def _make_handler(command: str, param_names: list, timeout: int) -> Callable:
             rendered = _stringify(value)
             # Expose the value under both the exact parameter name and its
             # upper-cased form so `$query` and `$QUERY` both work in templates.
-            env[pname] = rendered
-            env[pname.upper()] = rendered
+            # Never write an execution-sensitive variable (defense in depth —
+            # such parameter names are already rejected at load time).
+            for candidate in (pname, pname.upper()):
+                if candidate.upper() in _RESERVED_ENV:
+                    continue
+                env[candidate] = rendered
 
         bash = _find_bash()
         if bash is None:
@@ -222,31 +253,116 @@ def _make_handler(command: str, param_names: list, timeout: int) -> Callable:
                 "bash is required to run YAML tools but was not found on PATH",
                 success=False,
             )
+
+        # #68187: custom-tool calls go through the normal approval pipeline.
+        # The command template is user-authored, but a dangerous or hardline
+        # pattern in it must still be gated exactly like a `terminal` command
+        # (hardline block, deny rules, yolo bypass, interactive prompt).
         try:
-            proc = subprocess.run(
-                [bash, "-c", command],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=env,
+            from tools.approval import check_dangerous_command
+            approval = check_dangerous_command(command, env_type="local")
+        except Exception as exc:  # pragma: no cover - the gate must not fail open
+            return tool_error(f"Approval check failed: {exc}", success=False)
+        if not approval.get("approved", False):
+            return tool_error(
+                approval.get("message") or "Command blocked by the approval guard.",
+                success=False,
             )
-        except subprocess.TimeoutExpired:
-            return tool_error(f"Command timed out after {timeout}s", success=False)
+
+        try:
+            output, timed_out, returncode = _run_bounded(bash, command, env, timeout)
         except Exception as exc:  # pragma: no cover - defensive
             return tool_error(f"Command failed to start: {exc}", success=False)
-
-        output = (proc.stdout or "") + (proc.stderr or "")
-        if len(output) > _MAX_OUTPUT_CHARS:
-            output = output[:_MAX_OUTPUT_CHARS] + "\n… [output truncated]"
-        if proc.returncode != 0:
+        if timed_out:
+            return tool_error(f"Command timed out after {timeout}s", success=False)
+        if returncode != 0:
             return tool_error(
-                f"Command exited with status {proc.returncode}",
+                f"Command exited with status {returncode}",
                 success=False,
                 output=output,
             )
         return tool_result(output=output, exit_code=0)
 
     return handler
+
+
+def _run_bounded(
+    bash: str, command: str, env: dict, timeout: int,
+) -> Tuple[str, bool, Optional[int]]:
+    """Run ``bash -c command`` with bounded memory and clean timeout kill.
+
+    Returns ``(output, timed_out, returncode)``. Output is captured
+    incrementally and stops accumulating at ``_MAX_OUTPUT_CHARS`` (the child
+    keeps draining so it never blocks on a full pipe), so a runaway command
+    cannot exhaust memory before truncation. The child runs in its own process
+    group; on timeout the whole group is killed so orphaned descendants don't
+    leak.
+    """
+    import threading
+
+    kwargs: dict = {}
+    if os.name == "posix":
+        kwargs["start_new_session"] = True  # own process group for killpg
+    else:  # pragma: no cover - windows
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+    proc = subprocess.Popen(
+        [bash, "-c", command],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+        **kwargs,
+    )
+
+    chunks: list = []
+    captured = 0
+    truncated = False
+
+    def _drain() -> None:
+        nonlocal captured, truncated
+        try:
+            for piece in iter(lambda: proc.stdout.read(8192), ""):
+                room = _MAX_OUTPUT_CHARS - captured
+                if room > 0:
+                    chunks.append(piece[:room])
+                    captured += min(len(piece), room)
+                if len(piece) > room:
+                    truncated = True  # keep looping to drain (and discard) the rest
+        except Exception:  # pragma: no cover - pipe closed under us
+            pass
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+
+    reader = threading.Thread(target=_drain, daemon=True)
+    reader.start()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_group(proc)
+        proc.wait()
+        reader.join(timeout=2)
+        return "".join(chunks), True, None
+    reader.join(timeout=2)
+    output = "".join(chunks)
+    if truncated:
+        output += "\n… [output truncated]"
+    return output, False, proc.returncode
+
+
+def _terminate_group(proc: "subprocess.Popen") -> None:
+    """SIGKILL the child's whole process group (POSIX), else kill the child."""
+    try:
+        if os.name == "posix":
+            import signal
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        else:  # pragma: no cover - windows
+            proc.kill()
+    except Exception:  # pragma: no cover - already gone
+        pass
 
 
 def _stringify(value: Any) -> str:
