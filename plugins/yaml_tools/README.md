@@ -14,7 +14,7 @@ packages). A YAML tool is a real, callable, schema-typed tool.
 # ~/.hermes/tools/my_search.yaml
 name: my_search
 description: "Search my internal documentation"
-command: 'curl -s "https://internal-docs/search?q=$QUERY"'
+command: 'curl -s "https://internal-docs/search?q=$HERMES_TOOL_ARG_QUERY"'
 parameters:
   query:
     type: string
@@ -33,7 +33,7 @@ One file per tool. Extension `.yaml` or `.yml`.
 | --- | --- | --- |
 | `name` | yes | Tool name the model calls. Letters, digits, underscores; must start with a letter or underscore. |
 | `description` | recommended | What the tool does (shown to the model). |
-| `command` | yes | Shell command run with `bash -c`. Reference parameters as environment variables (see below). |
+| `command` | yes | Shell command run by the configured terminal backend. Reference parameters as `HERMES_TOOL_ARG_*` variables (see below). |
 | `parameters` | no | Mapping of parameter name → spec. |
 | `timeout` | no | Max seconds the command may run (default `60`, capped at `600`). |
 
@@ -48,32 +48,48 @@ Each parameter spec accepts:
 
 ## How parameters reach the command
 
-Each supplied parameter value is exported to the command's environment under
-**both** its exact name and its upper-cased name, so a parameter `query` is
-available as `$query` and `$QUERY`. Booleans are rendered as `true` / `false`.
+Each declared parameter is exported under the dedicated, upper-cased
+`HERMES_TOOL_ARG_<NAME>` namespace. A parameter named `query` is therefore
+available as `$HERMES_TOOL_ARG_QUERY`; booleans are rendered as `true` /
+`false`. An omitted optional parameter is exported as an empty string.
 
 ```yaml
-command: 'echo "greeting is $greeting"'   # $greeting or $GREETING both work
+command: 'echo "greeting is $HERMES_TOOL_ARG_GREETING"'
+```
+
+The dedicated prefix prevents model arguments such as `path` from replacing
+ambient variables such as `PATH`. Environment variables and API keys made
+available by the selected terminal backend remain accessible under their
+original names:
+
+```yaml
+command: 'curl -H "Authorization: Bearer $INTERNAL_API_KEY" \
+  "https://example.test/search?q=$HERMES_TOOL_ARG_QUERY"'
 ```
 
 ## Security
 
-Parameter **values** supplied by the model are passed as environment variables,
-never interpolated into the command string. bash does not re-parse the result
-of a variable expansion for command substitution, so a value such as
-`$(rm -rf ~)` or `"; rm -rf ~ ; "` is treated as a literal string and never
-executed. The command **template** itself is authored by you (trusted); only
-the argument values come from the model.
+Parameter values are shell-quoted into environment assignments inside an
+isolated subshell. A value such as `$(touch /tmp/example)` or `"; echo bad"`
+therefore remains data instead of becoming extra shell syntax. The complete
+wrapper then runs through the normal `terminal` tool, including its configured
+local/container/SSH backend, command approval checks, bounded output capture,
+timeouts, and descendant-process cleanup.
 
-Quote your expansions (`"$QUERY"`, not `$QUERY`) to also avoid word-splitting
-and globbing on values that contain spaces or shell glob characters.
+The command template is trusted code. Quote parameter expansions
+(`"$HERMES_TOOL_ARG_QUERY"`, not `$HERMES_TOOL_ARG_QUERY`) to avoid
+word-splitting and globbing, and do not pass model parameters to `eval` or use
+them deliberately as command text. Dangerous-looking parameter data may
+conservatively trigger the normal approval prompt.
+
+Model arguments are visible in the effective terminal command and should not
+be used to transport secrets. Put API keys in the ambient environment instead.
 
 ## Behaviour notes
 
 - Files are discovered at startup. Add/change a file, then restart Hermes.
 - A malformed file is logged and skipped — it never breaks startup.
-- A tool whose `name` collides with a built-in is skipped (built-ins are never
-  overridden).
+- Built-ins are never overridden by a YAML tool with the same name.
 - The `custom` toolset is part of the default set; disable it like any other
   toolset if you don't want user tools loaded.
 - `bash` must be available on `PATH`.
