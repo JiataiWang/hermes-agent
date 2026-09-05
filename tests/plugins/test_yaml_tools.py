@@ -391,12 +391,12 @@ def test_plugin_manager_registry_e2e(
 
     monkeypatch.setattr(terminal_mod, "terminal_tool", fake_terminal_tool)
 
-    from hermes_cli.plugins import PluginManager
+    from hermes_cli.plugins import PluginManager, parse_manifest_file
     from toolsets import resolve_toolset
 
     plugin_dir = Path(__file__).resolve().parents[2] / "plugins" / "yaml_tools"
     manager = PluginManager()
-    manifest = manager._parse_manifest(
+    manifest = parse_manifest_file(
         plugin_dir / "plugin.yaml", plugin_dir, "bundled", ""
     )
     assert manifest is not None
